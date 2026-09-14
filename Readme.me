@@ -1,0 +1,77 @@
+# Pata Amiga - MOdelo Dimensional de Análise de Pedidos
+## 1. Contexto de case
+## 2. Diagnóstico de origem
+## 3. Decisões de tratamento (ETL)
+## 4. Modelo dimencional (diagrama)
+## 5. As cinco respostas
+## 6. Como reproduzir o banco
+## 8. Video
+
+## 1. Contextualização
+A Pata Amiga é uma rede catarinense de pet shops que, em setembro de 2023, unificou a operação de pedidos vindos de cinco canais diferentes: app, site, telefone, WhatsApp e loja física. Em sete meses de operação unificada foram registrados 4.044 pedidos, mas esse dado ficou espalhado em três sistemas que não se conversam entre si: a plataforma de e-commerce, o cadastro de lojas do franchising e a planilha de praças de atendimento mantida pelo time de expansão. Cada sistema escreve os mesmos conceitos de um jeito diferente — a mesma loja aparece com acento, sem acento, em caixa alta e até com erro de digitação; a mesma categoria de produto tem dezenas de grafias; datas e valores em reais chegam como texto puro, sem padronização.
+Este projeto tem como objetivo construir o modelo dimensional que organiza esses três sistemas em um único data warehouse (`dw_pata_amiga`), permitindo responder cinco perguntas de negócio que hoje não têm resposta: onde está o gargalo da entrega, qual categoria sustenta o faturamento, se a política de desconto funciona igual em todos os canais, qual praça de atendimento concentra o faturamento e onde a rede deveria abrir a próxima loja.
+
+## 2. Diagnóstico da origem
+Antes de qualquer tratamento, a área de staging foi carregada exatamente como veio dos sistemas de origem, sem nenhuma alteração (`01-carga-staging.sql`). O levantamento inicial confirmou a dimensão do problema:
+| Item verificado | Quantidade |
+| Grafias distintas de categoria de produto | 37 |
+| Grafias distintas de nome de loja | 128 |
+| Pedidos sem código de loja preenchido | 1.575 (≈39%) |
+| Pedidos sem nome de loja preenchido | 3 |
+| Marcos em branco — Integração → Separação | 1.077 |
+| Marcos em branco — Separação → Nota Fiscal | 1.338 |
+| Marcos em branco — Nota Fiscal → Despacho | 1.665 |
+| Marcos em branco — Despacho → Entrega | 1.953 |
+As 37 grafias de categoria se resumem a apenas 7 categorias padronizadas quando agrupadas corretamente (Ração, Petisco, Medicamento, Higiene, Serviço, Acessório e Brinquedo), o que já sinalizava que o problema não era falta de dado, e sim falta de padronização. O mesmo vale para as 128 grafias de loja: a rede tem apenas 32 lojas, então cada loja aparecia em média com 4 escritas diferentes na origem. Os 1.953 marcos de entrega em branco não foram tratados como erro, mas como processo em aberto — são pedidos que, até o fim da janela de análise, ainda não haviam sido entregues.
+
+## 3. Decisões de tratamento (ETL)
+Toda a limpeza dos dados foi feita nos `INSERT` das dimensões e da fato, nunca com `UPDATE` ou `ALTER` nas tabelas de staging, e sem nenhuma subconsulta na carga — apenas `JOIN`, `LEFT JOIN` e `CASE WHEN`.
+**Datas em dois formatos na mesma tabela.** As datas de pedido e de integração ao ERP vêm de uma plataforma de e-commerce americana, no formato `MM/DD/AAAA HH:MI AM`, enquanto os quatro marcos do processo de entrega vêm no formato ISO `AAAA-MM-DD`. Converter a data do pedido usando `DD/MM/YYYY` faria o PostgreSQL lançar erro nas datas com mês maior que 12 — o banco identifica o problema na hora, então a máscara certa (`TO_TIMESTAMP(coluna, 'MM/DD/YYYY HH12:MI AM')`) foi decisiva para não perder ou distorcer nenhum pedido.
+**A ordem do `CASE WHEN` na categoria.** "Ração Medicamentosa" contém a substring "RA", então testar a condição de Ração antes da de Medicamento classificaria esse item na categoria errada. A ordem usada foi Medicamento → Petisco → Ração → Higiene → Brinquedo → Acessório → Serviço, sempre comparando em `UPPER` e sem acento (`TRANSLATE`), já que o PostgreSQL compara texto byte a byte e trataria "Ração", "RAÇÃO" e "racao" como três valores diferentes se a normalização não fosse aplicada.
+**Padronização do nome da loja antes do lookup.** A grafia da loja passou primeiro por um tratamento mecânico (remoção do sufixo "/SC" e de espaços duplicados) e só depois por um `CASE` escrito à mão para os três casos que sobraram e que não seguem nenhum padrão automatizável: um erro de digitação ("BLUMENAL" → "BLUMENAU"), um apelido ("FLORIPA" → "FLORIANOPOLIS") e uma abreviação ("JGUA" → "JARAGUA"). Fazer o lookup contra a `dim_loja` antes dessa padronização faria justamente esses três casos caírem na linha -1 por engano.
+**A regra dos números.** Valores em reais chegam em pelo menos quatro formatos diferentes na mesma coluna — "R$ 1.850,00", "1850.00", "1.200" e vazio ou "-". A regra aplicada trata vazio e "-" como `NULL`, nunca como zero, porque um zero no lugar de "não aconteceu" distorceria as médias de faturamento e de prazo de entrega para baixo.
+**Canal de pedido: WhatsApp antes de App.** A string "WHATSAPP" contém "APP", então o `CASE` testa a condição de WhatsApp primeiro; caso contrário, os 414 pedidos feitos por WhatsApp seriam contados como pedidos de App, distorcendo a resposta da P3.
+
+## 4. Modelo dimensional
+O modelo é uma estrela com quatro dimensões e uma tabela ponte em torno de uma única fato:
+- **`fato_pedido`** — grão de 1 linha por pedido, 4.044 linhas.
+- **`dim_tempo`** — usada duas vezes pela fato, em papéis diferentes (`sk_tempo_pedido` e `sk_tempo_entrega`), configurando uma *role-playing dimension*.
+- **`dim_loja`** — cadastro das 32 lojas, com porte, faixa de franquia e localização.
+- **`dim_categoria`** — grão de uma grafia de origem (38 linhas: 37 grafias + a linha -1), guardando tanto a grafia crua quanto o nome padronizado.
+- **`dim_praca`** e **`bridge_loja_praca`** — como uma loja atende mais de uma praça, essa relação N:N não cabe em uma FK direta; a ponte guarda o fator de rateio do público de cada loja em cada praça.
+*imagem do diagrama, exportada em PNG*
+
+## 5. As cinco respostas
+**P1 — Onde está o gargalo da entrega?**
+O intervalo mais lento do processo é entre a emissão da nota fiscal e o despacho para a transportadora, e esse gargalo não é o mesmo nos três portes de loja. Em lojas Grandes e Médias, esse intervalo leva em média 3,3 dias; em lojas Pequenas, sobe para 8,5 dias — mais que o dobro. Isso empurra o tempo total até a entrega de cerca de 7,9 dias nas lojas Grandes para 15,2 dias nas Pequenas, o que sugere que o problema não é a transportadora, e sim a capacidade de processamento interno das lojas menores entre a nota e o despacho.
+
+**P2 — Qual categoria concentra o faturamento?**
+Ração é a categoria campeã, respondendo por 60,01% do faturamento total da rede, seguida por Medicamento (17,06%) e Petisco (7,17%). Essa liderança se repete nos três portes de loja: Ração é a categoria mais vendida tanto em lojas Grandes quanto em Médias e Pequenas, o que indica que o mix de produtos é uma característica da marca, e não de um formato de loja específico.
+
+**P3 — O desconto funciona igual em todo canal?**
+Não, e o resultado é contraintuitivo: em todos os canais, o ticket médio dos pedidos COM desconto é maior que o dos pedidos SEM desconto — por exemplo, no App o ticket com desconto é de R$ 488,04 contra R$ 170,48 sem desconto. Isso sugere que o desconto não está sendo usado para reduzir o valor do carrinho, e sim aparecendo com mais frequência em pedidos já maiores, possivelmente como incentivo de compra em volume. Em termos de faturamento, o App concentra a maior parte das vendas da rede, com 30,79% do total, seguido por Site (25,13%) e Loja Física (20,11%).
+
+**P4 — Qual praça de atendimento concentra o faturamento?**
+Depois de aplicar o fator de rateio do público de cada loja, a praça Vale do Itajaí concentra o maior faturamento rateado da rede, R$ 633.746,09, bem acima da segunda colocada, Grande Florianópolis, com R$ 283.546,75. Mas ao cruzar esse faturamento com o número de domicílios com pet de cada praça, o quadro muda: Vale do Itajaí também lidera em faturamento por domicílio (4,28), enquanto praças como Foz do Itajaí têm um número alto de domicílios com pet (74.000) mas o menor faturamento por domicílio da rede (0,63) — um sinal de mercado pouco explorado ali.
+
+**P5 — Onde abrir a próxima loja, e o que os dados NÃO permitem afirmar?**
+Ao ranquear as lojas por itens vendidos por mil habitantes (e não em valor absoluto), a loja de Rio dos Cedros lidera com 41,87 itens por mil habitantes, seguida por Presidente Getúlio (34,84) e Ibirama (32,07) — todas em cidades pequenas, o que indica um mercado proporcionalmente muito mais aquecido do que o volume absoluto de vendas sugeriria. Ao mesmo tempo, essas lojas também têm os piores tempos médios de entrega da rede (14 a 16 dias, contra 7 a 8 dias nas lojas de porte maior), então o crescimento nessas praças hoje é limitado pela logística. Quanto à faixa de franquia, o faturamento por faixa ATUAL mostra que as lojas hoje classificadas como Ouro respondem por 56,39% do faturamento da rede — mas essa faixa é a foto de hoje, já que o cadastro de lojas foi sobrescrito e não guarda histórico. Isso significa que esse número não responde quanto do faturamento veio de lojas que já eram Ouro na data em que o pedido foi feito, apenas quanto vem de lojas que são Ouro atualmente.
+
+O que ficou de fora da análise, por limitação dos dados de origem: 3 pedidos sem loja identificada, 1.953 entregas ainda não concluídas até o fim da janela analisada, 257 pedidos sem a quantidade de itens informada e 121 pedidos sem o valor líquido informado.
+
+## 6. Leitura crítica e recomendação final
+Os dados sustentam que o gargalo operacional está concentrado nas lojas Pequenas, entre a nota fiscal e o despacho, e que há praças com alta densidade de domicílios com pet e faturamento por domicílio abaixo da média da rede — como Foz do Itajaí. Isso indica que expandir logística ou abrir uma nova loja nessa região tem potencial de mercado ainda não capturado.
+Por outro lado, os dados não permitem afirmar isso com a mesma certeza para cidades pequenas de alto desempenho relativo (como Rio dos Cedros): o indicador de itens por mil habitantes é favorável, mas o tempo de entrega nessas regiões já está no limite superior da rede, o que sugere que o problema ali não é falta de demanda, e sim capacidade logística — uma segunda loja na mesma região sem resolver esse gargalo teria efeito limitado. Da mesma forma, a análise de faturamento por faixa de franquia não pode ser usada para avaliar o desempenho histórico de cada loja, porque o cadastro guarda apenas a classificação atual.
+A recomendação final é priorizar a região de Foz do Itajaí para expansão ou reforço comercial, dado o volume de domicílios com pet ainda pouco explorado, condicionando essa decisão a uma revisão prévia da capacidade de despacho da rede — sem isso, o mesmo gargalo hoje visto nas lojas Pequenas tende a se repetir em qualquer loja nova.
+
+## 7. Como reproduzir o banco
+Os scripts devem ser executados na seguinte ordem:
+1. `01-carga-staging.sql` — cria o banco e carrega as três tabelas de staging exatamente como vieram da origem.
+2. `02-dimensoes-prontas.sql` — carrega as dimensões `dim_tempo` e `dim_loja`, já prontas.
+3. `03-dimensoes.sql` — constrói `dim_categoria`, `dim_praca` e `bridge_loja_praca`.
+4. `04-fato.sql` — constrói `fato_pedido`, com uma linha por pedido (4.044 linhas) e nenhuma FK nula.
+5. `05-perguntas.sql` — contém as cinco consultas que respondem às perguntas de negócio.
+Todo o pipeline também pode ser executado de ponta a ponta pelo script Python (`projeto3.py`), que roda os arquivos SQL na ordem correta e imprime as conferências de cada etapa.
+
+## 8. Vídeo
+link do google drive (apenas para leitura) : 
