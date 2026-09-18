@@ -74,3 +74,9 @@ Os scripts devem ser executados na seguinte ordem:
 Todo o pipeline também pode ser executado de ponta a ponta pelo script Python (`projeto3.py`), que roda os arquivos SQL na ordem correta e imprime as conferências de cada etapa.
 
 ## 8. Vídeo
+https://drive.google.com/file/d/1_TaOzmFC9N3ZhoqKOrqab2F4wqUM_bGE/view?usp=drive_link
+
+
+
+
+.
