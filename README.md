@@ -39,7 +39,7 @@ O modelo é uma estrela com quatro dimensões e uma tabela ponte em torno de uma
 - **`dim_loja`** — cadastro das 32 lojas, com porte, faixa de franquia e localização.
 - **`dim_categoria`** — grão de uma grafia de origem (38 linhas: 37 grafias + a linha -1), guardando tanto a grafia crua quanto o nome padronizado.
 - **`dim_praca`** e **`bridge_loja_praca`** — como uma loja atende mais de uma praça, essa relação N:N não cabe em uma FK direta; a ponte guarda o fator de rateio do público de cada loja em cada praça.
-*imagem do diagrama, exportada em PNG (Colorido Moderno Mapa Mental Gráfico(1).png)*
+*imagem do diagrama, exportada em PNG (Diagrama Estrela.png)*
 
 ## 5. As cinco respostas
 **P1 — Onde está o gargalo da entrega?**
